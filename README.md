@@ -35,4 +35,4 @@ You can rotate, zoom, and translate the cube naturally using both hands, with ea
 Make sure you have **Python 3.8+** installed, then install these dependencies:
 
 ```bash
-pip install opencv-python mediapipe pygame PyOpenGL PyOpenGL_accelerate
+pip install opencv-python mediapipe pygame PyOpenGL PyOpenGL_accelerate pywavefront
