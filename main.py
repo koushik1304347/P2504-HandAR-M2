@@ -1,223 +1,204 @@
+from ursina import *
 import cv2
-import pygame
-from pygame.locals import *
-from OpenGL.GL import *
-from OpenGL.GLU import *
 import mediapipe as mp
 import math
-import pywavefront
+import numpy as np
 import datetime
 import os
-import numpy as np
 
-# Directory to save screenshots
+
+# ============================================
+# 1) Ursina Setup
+# ============================================
+app = Ursina()
+window.color = color.black
+
+# Load GLB model
+car = Entity(
+    model='vintage_racing_car.glb',   # your GLB
+    scale=1,
+    origin=Vec3(0, 0, 0),
+    position=Vec3(0, 0, 0)
+)
+
+# Initial camera position
+camera.position = Vec3(0, 0, -6)
+camera.look_at(car.position)
+
+# Screenshot folder
 os.makedirs("screenshots", exist_ok=True)
-screenshot_taken = False
 
-# -------------------- HAND TRACKING SETUP --------------------
+
+# ============================================
+# 2) Mediapipe Setup
+# ============================================
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.8, min_tracking_confidence=0.8)
+hands = mp_hands.Hands(
+    max_num_hands=2,
+    min_detection_confidence=0.8,
+    min_tracking_confidence=0.8
+)
 
+cap = cv2.VideoCapture(0)
+
+
+# ============================================
+# 3) Gesture Helpers
+# ============================================
 def get_pinch_strength(hand_landmarks):
-    thumb_tip = hand_landmarks.landmark[4]
-    index_tip = hand_landmarks.landmark[8]
-    distance = math.sqrt((thumb_tip.x - index_tip.x)**2 + (thumb_tip.y - index_tip.y)**2)
-    min_dist, max_dist = 0.02, 0.2
-    return 1 - min(1, max(0, (distance - min_dist) / (max_dist - min_dist)))
+    t = hand_landmarks.landmark[4]
+    i = hand_landmarks.landmark[8]
+    d = math.dist((t.x, t.y), (i.x, i.y))
+    return max(0, min(1, 1 - (d - 0.02) / 0.2))
 
-def is_palm_open(hand_landmarks):
-    finger_tips = [8, 12, 16, 20]
-    finger_mcps = [5, 9, 13, 17]
-    extended = sum(hand_landmarks.landmark[tip].y < hand_landmarks.landmark[mcp].y for tip, mcp in zip(finger_tips, finger_mcps))
-    return extended >= 3
 
-def is_peace_sign(hand_landmarks):
-    lm = hand_landmarks.landmark
-    index_up = lm[8].y < lm[6].y
-    middle_up = lm[12].y < lm[10].y
-    ring_down = lm[16].y > lm[14].y
-    pinky_down = lm[20].y > lm[18].y
-    return index_up and middle_up and ring_down and pinky_down
+def is_open_hand(hand):
+    lm = hand.landmark
+    tips = [8, 12, 16, 20]
+    base = [5, 9, 13, 17]
+    extended = sum(lm[t].y < lm[b].y for t, b in zip(tips, base))
+    thumb_open = abs(lm[4].x - lm[3].x) > 0.05
+    return extended >= 4 and thumb_open
 
-# NEW FUNCTION: Detect thumbs up gesture
-def is_thumbs_up(hand_landmarks):
-    lm = hand_landmarks.landmark
-    # Thumb tip above thumb MCP (upward direction)
+
+def is_peace(hand):
+    lm = hand.landmark
+    return (lm[8].y < lm[6].y and
+            lm[12].y < lm[10].y and
+            lm[16].y > lm[14].y and
+            lm[20].y > lm[18].y)
+
+
+def is_thumbs_up(hand):
+    lm = hand.landmark
     thumb_up = lm[4].y < lm[3].y < lm[2].y
-    # Other fingers folded
-    fingers_folded = all(lm[tip].y > lm[base].y for tip, base in zip([8, 12, 16, 20], [5, 9, 13, 17]))
+    fingers_folded = all(lm[t].y > lm[b].y for t, b in zip([8,12,16,20],[5,9,13,17]))
     return thumb_up and fingers_folded
 
-# -------------------- PYGAME + OPENGL INIT --------------------
-cap = cv2.VideoCapture(0)
-pygame.init()
-display = (800, 600)
-pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
-pygame.display.set_caption("Hand Controlled 3D Model (with Color)")
-gluPerspective(45, (display[0]/display[1]), 0.1, 100.0)
-glEnable(GL_DEPTH_TEST)
-glEnable(GL_BLEND)
-glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-# -------------------- LOAD 3D MODEL --------------------
-model_path = "model.obj"
-scene = pywavefront.Wavefront(model_path, collect_faces=True, create_materials=True)
-
-def draw_model(paused):
-    glPushMatrix()
-    glScalef(0.1, 0.1, 0.1)
-    for mesh in scene.mesh_list:
-        material = mesh.materials
-        if hasattr(material, "diffuse"):
-            color = material.diffuse
-        else:
-            color = [0.7, 0.7, 0.7]
-        if paused:
-            color = [c * 0.5 for c in color]
-        glColor4f(*color, 1.0)
-        glBegin(GL_TRIANGLES)
-        for face in mesh.faces:
-            for vertex_i in face:
-                vertex = scene.vertices[vertex_i]
-                glVertex3f(*vertex)
-        glEnd()
-    glPopMatrix()
-
-# -------------------- SCREENSHOT FUNCTION --------------------
-def take_screenshot():
-    width, height = display
-    data = glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE)
-    image = np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)
-    image = np.flipud(image)  # Flip vertically
-    surface = pygame.image.frombuffer(image.tobytes(), (width, height), "RGB")
-
-    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    screenshot_path = os.path.join("screenshots", f"screenshot_{now}.png")
-    pygame.image.save(surface, screenshot_path)
-    print(f"📸 Screenshot saved: {screenshot_path}")
-
-# -------------------- CONTROL VARIABLES --------------------
-zoom_z = -5
-translate_x = 0
-translate_y = 0
-rotate_x = 0
-rotate_y = 0
+# ============================================
+# 4) Control Variables
+# ============================================
 paused = False
-
 last_right_x = last_right_y = None
 last_left_x = last_left_y = None
-last_pinch_strength = 0
-zoom_speed = 0.1
+last_pinch = 0
+screenshot_done = False
 
-clock = pygame.time.Clock()
-running = True
 
-# -------------------- MAIN LOOP --------------------
-while running:
-    for event in pygame.event.get():
-        if event.type == QUIT:
-            running = False
+# ============================================
+# 5) Screenshot Function
+# ============================================
+def take_screenshot():
+    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = f"screenshots/snap_{now}.png"
+    window.screenshot(name=path)
+    print("📸 Saved:", path)
 
-    ret, frame = cap.read()
-    if not ret:
-        break
+
+# ============================================
+# 6) UPDATE LOOP
+# ============================================
+def update():
+    global paused, last_right_x, last_right_y
+    global last_left_x, last_left_y, last_pinch
+    global screenshot_done
+
+    # get cam frame
+    ok, frame = cap.read()
+    if not ok:
+        return
 
     frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb)
+    res = hands.process(rgb)
 
-    right_hand, left_hand = None, None
-    if result.multi_handedness:
-        for idx, handedness in enumerate(result.multi_handedness):
-            label = handedness.classification[0].label
-            hand_landmarks = result.multi_hand_landmarks[idx]
+    # detect hands
+    left = right = None
+    if res.multi_hand_landmarks and res.multi_handedness:
+        for i, h in enumerate(res.multi_handedness):
+            label = h.classification[0].label
+            lm = res.multi_hand_landmarks[i]
             if label == "Right":
-                right_hand = hand_landmarks
-            elif label == "Left":
-                left_hand = hand_landmarks
+                right = lm
+            else:
+                left = lm
 
-    # Pause if left hand is open
-    paused = left_hand and is_palm_open(left_hand)
+    # Pause if left hand open
+    paused = left and is_open_hand(left)
 
-    # NEW: Realign model if right-hand thumbs up
-    if right_hand and is_thumbs_up(right_hand):
-        translate_x = 0
-        translate_y = 0
-        rotate_x = 0
-        rotate_y = 0
-        zoom_z = -5
-        print("🔄 Model realigned to center!")
+    # Reset (when paused)
+    if paused and right and is_thumbs_up(right):
+        car.position = Vec3(0, 0, 0)
+        car.rotation = Vec3(0, 0, 0)
+        camera.position = Vec3(0, 0, -6)
+        print("🔄 Reset")
 
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-    glLoadIdentity()
-    gluPerspective(45, (display[0]/display[1]), 0.1, 100.0)
-    glTranslatef(translate_x, translate_y, zoom_z)
-    glRotatef(rotate_x, 1, 0, 0)
-    glRotatef(rotate_y, 0, 1, 0)
-    draw_model(paused)
-    pygame.display.flip()
-
-    # Take screenshot with right-hand peace sign when paused
-    if paused and right_hand and is_peace_sign(right_hand) and not screenshot_taken:
+    # Screenshot
+    if paused and right and is_peace(right) and not screenshot_done:
         take_screenshot()
-        screenshot_taken = True
-    elif not paused:
-        screenshot_taken = False
-
-    # Controls active only when not paused
+        screenshot_done = True
     if not paused:
-        # Right hand controls rotation and zoom
-        if right_hand:
-            frame_h, frame_w, _ = frame.shape
-            index_tip = right_hand.landmark[8]
-            cx, cy = int(index_tip.x * frame_w), int(index_tip.y * frame_h)
-            if last_right_x is not None and last_right_y is not None:
-                dx, dy = cx - last_right_x, cy - last_right_y
-                rotate_y += dx * 0.5
-                rotate_x += dy * 0.5
-            last_right_x, last_right_y = cx, cy
-            pinch_strength = get_pinch_strength(right_hand)
-            zoom_z -= (pinch_strength - last_pinch_strength) * zoom_speed * 120
-            zoom_z = max(-15, min(-0.5, zoom_z))
-            last_pinch_strength = pinch_strength
+        screenshot_done = False
+
+    # Controls only when not paused
+    if not paused:
+        h, w, _ = frame.shape
+
+        # RIGHT HAND → rotate + zoom
+        if right:
+            rx = int(right.landmark[8].x * w)
+            ry = int(right.landmark[8].y * h)
+
+            if last_right_x is not None:
+                dx = rx - last_right_x
+                dy = ry - last_right_y
+                car.rotation_y += dx * 0.4
+                car.rotation_x -= dy * 0.4
+
+            last_right_x, last_right_y = rx, ry
+
+            pinch = get_pinch_strength(right)
+            zoom = (last_pinch - pinch) * 2
+
+            # Fix: old Ursina requires full Vec3 update
+            camera.position = Vec3(
+                camera.position.x,
+                camera.position.y,
+                camera.position.z + zoom
+            )
+
+            last_pinch = pinch
         else:
             last_right_x = last_right_y = None
-            last_pinch_strength = 0
+            last_pinch = 0
 
-        # Left hand controls translation
-        if left_hand:
-            frame_h, frame_w, _ = frame.shape
-            index_tip = left_hand.landmark[8]
-            cx, cy = int(index_tip.x * frame_w), int(index_tip.y * frame_h)
-            if last_left_x is not None and last_left_y is not None:
-                dx = (cx - last_left_x) / frame_w
-                dy = (cy - last_left_y) / frame_h
-                translate_x += dx * 25
-                translate_y -= dy * 25
-            last_left_x, last_left_y = cx, cy
+        # LEFT HAND → translation
+        if left:
+            lx = int(left.landmark[8].x * w)
+            ly = int(left.landmark[8].y * h)
+
+            if last_left_x is not None:
+                dx = (lx - last_left_x) / w
+                dy = (ly - last_left_y) / h
+                car.position = Vec3(
+                    car.position.x + dx * 3,
+                    car.position.y - dy * 3,
+                    car.position.z
+                )
+
+            last_left_x, last_left_y = lx, ly
         else:
             last_left_x = last_left_y = None
-    else:
-        last_left_x = last_left_y = None
-        last_right_x = last_right_y = None
 
-    # -------------------- FEEDBACK TEXT --------------------
-    if paused:
-        if right_hand and is_peace_sign(right_hand):
-            cv2.putText(frame, "📸 Screenshot Taken!", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 4)
-        else:
-            cv2.putText(frame, "Paused (Show PEACE to capture)", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 4)
+    # show webcam
+    cv2.imshow("Hand Tracking", frame)
+    cv2.waitKey(1)
 
-    if right_hand and is_thumbs_up(right_hand) and paused:
-        cv2.putText(frame, "🔄 Model Realigned!", (50, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 128, 0), 4)
 
-    # -------------------- SHOW WEBCAM --------------------
-    cv2.imshow("Webcam Feed", frame)
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-    clock.tick(60)
-
+# ============================================
+# 7) RUN APP
+# ============================================
+app.run()
 cap.release()
 cv2.destroyAllWindows()
-pygame.quit()
