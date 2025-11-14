@@ -163,8 +163,3 @@ snap_20240215_184200.png
 
 ---
 
-## 📄 License
-
-You may freely use, modify, and redistribute this project.
-
----
