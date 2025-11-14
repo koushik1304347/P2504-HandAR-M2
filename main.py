@@ -7,104 +7,118 @@ import datetime
 import os
 
 
-# ============================================
-# 1) Ursina Setup
-# ============================================
 app = Ursina()
 window.color = color.black
 
-# Load GLB model
-car = Entity(
-    model='vintage_racing_car.glb',   # your GLB
-    scale=1,
-    origin=Vec3(0, 0, 0),
-    position=Vec3(0, 0, 0)
-)
-
-# Initial camera position
-camera.position = Vec3(0, 0, -6)
-camera.look_at(car.position)
-
-# Screenshot folder
 os.makedirs("screenshots", exist_ok=True)
 
+car = Entity(
+    model='vintage_racing_car.glb',
+    scale=1
+)
 
-# ============================================
-# 2) Mediapipe Setup
-# ============================================
+try:
+    min_b, max_b = car.model.get_tight_bounds()
+except:
+    min_b, max_b = car.get_tight_bounds()
+
+center = (min_b + max_b) / 2
+car.origin = center
+car.position = Vec3(0, 0, 0)
+
+size = max(
+    max_b.x - min_b.x,
+    max_b.y - min_b.y,
+    max_b.z - min_b.z
+)
+if size > 0:
+    car.scale = 3 / size
+
+camera.position = Vec3(0, 0, -12)
+camera.look_at(car.position)
+
+
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     max_num_hands=2,
     min_detection_confidence=0.8,
     min_tracking_confidence=0.8
 )
-
 cap = cv2.VideoCapture(0)
 
 
-# ============================================
-# 3) Gesture Helpers
-# ============================================
-def get_pinch_strength(hand_landmarks):
-    t = hand_landmarks.landmark[4]
-    i = hand_landmarks.landmark[8]
-    d = math.dist((t.x, t.y), (i.x, i.y))
-    return max(0, min(1, 1 - (d - 0.02) / 0.2))
-
-
-def is_open_hand(hand):
+def is_open_palm_relaxed(hand):
     lm = hand.landmark
-    tips = [8, 12, 16, 20]
-    base = [5, 9, 13, 17]
-    extended = sum(lm[t].y < lm[b].y for t, b in zip(tips, base))
-    thumb_open = abs(lm[4].x - lm[3].x) > 0.05
-    return extended >= 4 and thumb_open
+    tips = [8, 12, 16]
+    bases = [5, 9, 13]
+    fingers_up = sum(lm[t].y < lm[b].y - 0.01 for t, b in zip(tips, bases))
+    return fingers_up >= 2
 
 
 def is_peace(hand):
     lm = hand.landmark
-    return (lm[8].y < lm[6].y and
-            lm[12].y < lm[10].y and
-            lm[16].y > lm[14].y and
-            lm[20].y > lm[18].y)
+    return (lm[8].y < lm[6].y and lm[12].y < lm[10].y
+            and lm[16].y > lm[14].y and lm[20].y > lm[18].y)
 
 
 def is_thumbs_up(hand):
     lm = hand.landmark
-    thumb_up = lm[4].y < lm[3].y < lm[2].y
-    fingers_folded = all(lm[t].y > lm[b].y for t, b in zip([8,12,16,20],[5,9,13,17]))
-    return thumb_up and fingers_folded
+
+    # Thumb must be HIGH above other thumb joints
+    thumb_up = lm[4].y < lm[3].y < lm[2].y - 0.015
+
+    # Other 4 fingers must be folded (tip BELOW the knuckle)
+    folded = 0
+    fingers = [(8, 5), (12, 9), (16, 13), (20, 17)]
+    for tip, base in fingers:
+        if lm[tip].y > lm[base].y + 0.01:   # stricter requirement
+            folded += 1
+
+    return thumb_up and folded == 4
+
 
 
 # ============================================
-# 4) Control Variables
+# STATE VARIABLES
 # ============================================
+alpha = 0.25  # smoothing
+
+smooth_rx = smooth_ry = 0
+smooth_tx = smooth_ty = 0
+
+# zoom
+last_zoom_strength = None
+smooth_zoom = 0
+ZOOM_ALPHA = 0.35
+ZOOM_STRENGTH = 50  # stronger zoom
+
+# pause
+PAUSE_FRAMES = 0
+PAUSE_TARGET = 2  # faster pause
+
 paused = False
-last_right_x = last_right_y = None
-last_left_x = last_left_y = None
-last_pinch = 0
 screenshot_done = False
 
+# memories
+last_right_x = last_right_y = None
+last_left_wrist_x = last_left_wrist_y = None
 
-# ============================================
-# 5) Screenshot Function
-# ============================================
+
 def take_screenshot():
     now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = f"screenshots/snap_{now}.png"
-    window.screenshot(name=path)
-    print("📸 Saved:", path)
+    prefix = f"screenshots/snap_{now}"
+    base.screenshot(prefix)
+    print("📸 Screenshot saved:", prefix)
 
 
-# ============================================
-# 6) UPDATE LOOP
-# ============================================
 def update():
-    global paused, last_right_x, last_right_y
-    global last_left_x, last_left_y, last_pinch
-    global screenshot_done
+    global paused, screenshot_done
+    global last_right_x, last_right_y
+    global last_left_wrist_x, last_left_wrist_y
+    global smooth_rx, smooth_ry, smooth_tx, smooth_ty
+    global last_zoom_strength, smooth_zoom
+    global PAUSE_FRAMES
 
-    # get cam frame
     ok, frame = cap.read()
     if not ok:
         return
@@ -113,92 +127,116 @@ def update():
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     res = hands.process(rgb)
 
-    # detect hands
     left = right = None
+
     if res.multi_hand_landmarks and res.multi_handedness:
         for i, h in enumerate(res.multi_handedness):
             label = h.classification[0].label
-            lm = res.multi_hand_landmarks[i]
-            if label == "Right":
-                right = lm
+            hand_lm = res.multi_hand_landmarks[i]
+            if label == "Left":
+                left = hand_lm
             else:
-                left = lm
+                right = hand_lm
 
-    # Pause if left hand open
-    paused = left and is_open_hand(left)
+    if left and is_open_palm_relaxed(left):
+        PAUSE_FRAMES += 1
+    else:
+        PAUSE_FRAMES = 0#max(0, PAUSE_FRAMES - 1)
 
-    # Reset (when paused)
+    paused = PAUSE_FRAMES >= PAUSE_TARGET
+
+
     if paused and right and is_thumbs_up(right):
         car.position = Vec3(0, 0, 0)
         car.rotation = Vec3(0, 0, 0)
-        camera.position = Vec3(0, 0, -6)
-        print("🔄 Reset")
+        camera.position = Vec3(0, 0, -12)
+        camera.look_at(car.position)
+        print("🔄 Reset!")
 
-    # Screenshot
     if paused and right and is_peace(right) and not screenshot_done:
         take_screenshot()
         screenshot_done = True
+
     if not paused:
         screenshot_done = False
 
-    # Controls only when not paused
+
     if not paused:
         h, w, _ = frame.shape
 
-        # RIGHT HAND → rotate + zoom
+        #ROTATION
+        
         if right:
-            rx = int(right.landmark[8].x * w)
-            ry = int(right.landmark[8].y * h)
+            ix = int(right.landmark[8].x * w)
+            iy = int(right.landmark[8].y * h)
 
             if last_right_x is not None:
-                dx = rx - last_right_x
-                dy = ry - last_right_y
-                car.rotation_y += dx * 0.4
-                car.rotation_x -= dy * 0.4
+                dx, dy = ix - last_right_x, iy - last_right_y
+                raw_rx = -dy * 2.0
+                raw_ry = dx * 2.0
+                smooth_rx = smooth_rx * (1-alpha) + raw_rx * alpha
+                smooth_ry = smooth_ry * (1-alpha) + raw_ry * alpha
+                car.rotation_x += smooth_rx
+                car.rotation_y += smooth_ry
 
-            last_right_x, last_right_y = rx, ry
-
-            pinch = get_pinch_strength(right)
-            zoom = (last_pinch - pinch) * 2
-
-            # Fix: old Ursina requires full Vec3 update
-            camera.position = Vec3(
-                camera.position.x,
-                camera.position.y,
-                camera.position.z + zoom
-            )
-
-            last_pinch = pinch
+            last_right_x, last_right_y = ix, iy
         else:
             last_right_x = last_right_y = None
-            last_pinch = 0
 
-        # LEFT HAND → translation
-        if left:
-            lx = int(left.landmark[8].x * w)
-            ly = int(left.landmark[8].y * h)
 
-            if last_left_x is not None:
-                dx = (lx - last_left_x) / w
-                dy = (ly - last_left_y) / h
-                car.position = Vec3(
-                    car.position.x + dx * 3,
-                    car.position.y - dy * 3,
-                    car.position.z
-                )
+        #ZOOM
 
-            last_left_x, last_left_y = lx, ly
+        if right:
+            lm = right.landmark
+            # pinch distance
+            pd = math.dist(
+                (lm[4].x, lm[4].y),
+                (lm[8].x, lm[8].y)
+            )
+            # convert to strength
+            pinch_strength = max(0.0, min(1.0, (pd - 0.02) / 0.15))
+            pinch_strength = 1 - pinch_strength
+
+            if last_zoom_strength is not None:
+                delta = pinch_strength - last_zoom_strength
+                zoom_amount = delta * ZOOM_STRENGTH
+                zoom_amount *= abs(delta) * 2
+                smooth_zoom = smooth_zoom * (1 - ZOOM_ALPHA) + zoom_amount * ZOOM_ALPHA
+                new_z = camera.position.z - smooth_zoom
+                new_z = max(-35, min(-3, new_z))
+                camera.position = Vec3(camera.position.x, camera.position.y, new_z)
+
+            last_zoom_strength = pinch_strength
         else:
-            last_left_x = last_left_y = None
+            last_zoom_strength = None
 
-    # show webcam
-    cv2.imshow("Hand Tracking", frame)
-    cv2.waitKey(1)
+        #TRANSLATION
+
+        if left:
+            wx = int(left.landmark[0].x * w)
+            wy = int(left.landmark[0].y * h)
+
+            if last_left_wrist_x is not None:
+                dx = (wx - last_left_wrist_x) / w
+                dy = (wy - last_left_wrist_y) / h
+
+                raw_tx = dx * 15
+                raw_ty = -dy * 15
+
+                smooth_tx = smooth_tx * (1 - alpha) + raw_tx * alpha
+                smooth_ty = smooth_ty * (1 - alpha) + raw_ty * alpha
+
+                car.position += Vec3(smooth_tx, smooth_ty, 0)
+
+            last_left_wrist_x, last_left_wrist_y = wx, wy
+        else:
+            last_left_wrist_x = last_left_wrist_y = None
+
+    #cv2.imshow("Webcam", frame)
+    #cv2.waitKey(1)
 
 
-# ============================================
-# 7) RUN APP
-# ============================================
+
 app.run()
 cap.release()
 cv2.destroyAllWindows()
