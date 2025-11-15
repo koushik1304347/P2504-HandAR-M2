@@ -66,21 +66,15 @@ def is_thumbs_up(hand):
 
     # Thumb must be HIGH above other thumb joints
     thumb_up = lm[4].y < lm[3].y < lm[2].y - 0.015
-
-    # Other 4 fingers must be folded (tip BELOW the knuckle)
     folded = 0
     fingers = [(8, 5), (12, 9), (16, 13), (20, 17)]
     for tip, base in fingers:
-        if lm[tip].y > lm[base].y + 0.01:   # stricter requirement
+        if lm[tip].y > lm[base].y + 0.01:  
             folded += 1
 
     return thumb_up and folded == 4
 
 
-
-# ============================================
-# STATE VARIABLES
-# ============================================
 alpha = 0.25  # smoothing
 
 smooth_rx = smooth_ry = 0
@@ -108,7 +102,7 @@ def take_screenshot():
     now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = f"screenshots/snap_{now}"
     base.screenshot(prefix)
-    print("📸 Screenshot saved:", prefix)
+    print("Screenshot saved:", prefix)
 
 
 def update():
@@ -151,7 +145,7 @@ def update():
         car.rotation = Vec3(0, 0, 0)
         camera.position = Vec3(0, 0, -12)
         camera.look_at(car.position)
-        print("🔄 Reset!")
+        print(" Reset!")
 
     if paused and right and is_peace(right) and not screenshot_done:
         take_screenshot()
